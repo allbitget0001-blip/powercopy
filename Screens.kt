@@ -972,8 +972,6 @@ class ProtectionScreen(private val a: MainActivity) {
         col.addView(a.appBlockModeCard("msg"), lp(MATCH, WRAP, b = a.dp(12)))
         col.addView(a.lockedAppsCard("msg"), lp(MATCH, WRAP, b = a.dp(12)))
         col.addView(a.imageGuardCard(), lp(MATCH, WRAP, b = a.dp(12)))
-        col.addView(a.lockdownAppsCard(), lp(MATCH, WRAP, b = a.dp(12)))
-        col.addView(a.lockedAppsCard("lockdown"), lp(MATCH, WRAP, b = a.dp(12)))
         col.addView(a.diagnosticCard(), lp(MATCH, WRAP, b = a.dp(12)))
         return sv
     }

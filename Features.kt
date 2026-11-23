@@ -71,7 +71,7 @@ object Extra {
 
     /** Build number, bumped on every push — shown in Settings so the user can
      * confirm which build is installed. A String because L.num takes a String. */
-    const val BUILD_ID = "45"
+    const val BUILD_ID = "46"
 
     // ---------- presets ----------
 
@@ -1338,8 +1338,8 @@ fun MainActivity.imageGuardCard(): View {
     c.addView(
         tv(
             L.t(
-                "While a lock runs, on-device AI watches the screen inside your chosen scan apps and covers nude photos or videos the moment they appear. Experimental — it can sometimes be wrong, and it uses more battery. No image ever leaves the phone. The powerful model downloads once (~106 MB — Wi-Fi recommended).",
-                "লক চলাকালীন ফোনের ভেতরেই AI শুধু বাছা অ্যাপগুলোর স্ক্রিন দেখবে, আর নগ্ন ছবি বা ভিডিও আসলেই তা ঢেকে দেবে। পরীক্ষামূলক — মাঝে মাঝে ভুল হতে পারে, আর ব্যাটারি একটু বেশি খাবে। কোনো ছবি ফোনের বাইরে যাবে না। শক্তিশালী মডেল একবার ডাউনলোড হবে (~১০৬ MB — Wi-Fi দিয়ে করা ভালো)।"
+                "While a lock runs, on-device AI watches the screen in every app and covers nude photos or videos the moment they appear. Experimental — it can sometimes be wrong, and it uses more battery. No image ever leaves the phone. The powerful model downloads once (~106 MB — Wi-Fi recommended).",
+                "লক চলাকালীন ফোনের ভেতরেই AI সব অ্যাপের স্ক্রিন দেখবে, আর নগ্ন ছবি বা ভিডিও আসলেই তা ঢেকে দেবে। পরীক্ষামূলক — মাঝে মাঝে ভুল হতে পারে, আর ব্যাটারি একটু বেশি খাবে। কোনো ছবি ফোনের বাইরে যাবে না। শক্তিশালী মডেল একবার ডাউনলোড হবে (~১০৬ MB — Wi-Fi দিয়ে করা ভালো)।"
             ),
             13f, C.muted
         ),
@@ -1539,40 +1539,6 @@ fun MainActivity.imageGuardCard(): View {
     }
     if (locked) {
         c.addView(tv(L.t("While a session runs, the guard cannot be turned off, sensitivity can only be increased, and the model cannot be changed.", "সেশন চলাকালীন সুরক্ষা বন্ধ করা যাবে না, সংবেদনশীলতা শুধু বাড়ানো যাবে, আর মডেল বদলানো যাবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
-    }
-    return c
-}
-
-/** Scan list: the guard only looks for bad images inside these apps.
- * Other apps keep opening normally and are never scanned, which also
- * saves battery. */
-fun MainActivity.lockdownAppsCard(): View {
-    val c = card()
-    c.addView(section(L.t("Apps to scan", "স্ক্যান করার অ্যাপ")))
-    c.addView(
-        tv(
-            L.t("The guard only watches the apps you choose here — other apps keep opening normally and are never scanned, which also saves battery. Choose the apps where bad content could appear — browsers, gallery, social apps.", "গার্ড শুধু এখানে বাছা অ্যাপগুলোতেই খারাপ ছবি খুঁজবে — বাকি অ্যাপগুলো স্বাভাবিকভাবে খুলবে আর সেগুলোতে স্ক্যান হবে না, তাই ব্যাটারিও কম খাবে। যেসব অ্যাপে খারাপ জিনিস আসতে পারে সেগুলো বাছুন — ব্রাউজার, গ্যালারি, সোশ্যাল অ্যাপ।"),
-            13f, C.muted
-        ),
-        lp(MATCH, WRAP, t = dp(6))
-    )
-    val count = Extra.lockdownApps(this).size
-    val locked = Store.isActive(this)
-    val pick = outlineBtn(L.t("Choose apps ($count selected)", "অ্যাপ বাছুন ($count টি নির্বাচিত)"), C.primary)
-    pick.setOnClickListener {
-        // adding only strengthens the lock, so it stays allowed during a
-        // session — the picker just won't let an already-chosen app be unchecked
-        appBlockPicker("lockdown", Store.isActive(this)) { go(4) }
-    }
-    c.addView(pick, lp(MATCH, dp(48), t = dp(10)))
-    val pkgBtn = outlineBtn(L.t("Add by package name", "প্যাকেজ নাম দিয়ে অ্যাড করুন"), C.primary)
-    pkgBtn.setOnClickListener { addPackageDialog("lockdown") { go(4) } }
-    c.addView(pkgBtn, lp(MATCH, dp(48), t = dp(8)))
-    if (count == 0) {
-        c.addView(tv(L.t("No apps chosen — the guard will scan nothing.", "কোনো অ্যাপ বাছা হয়নি — গার্ড কিছুই স্ক্যান করবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
-    }
-    if (locked) {
-        c.addView(tv(L.t("While a session runs, apps can only be added, not removed.", "সেশন চলাকালীন শুধু অ্যাপ যোগ করা যাবে, সরানো যাবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
     }
     return c
 }

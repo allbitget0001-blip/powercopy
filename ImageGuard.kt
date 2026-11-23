@@ -759,14 +759,9 @@ class ImageGuardService : Service() {
                     }
                 } else {
                     idleTicks = 0
-                    // scoped scanning: only the apps on the scan list are
-                    // watched (the user's choice)
-                    if (shouldScan()) {
-                        lastSkipLine = null
-                        requestShot()
-                    } else {
-                        logScanSkipped()
-                    }
+                    // scan everywhere: the guard watches the whole screen,
+                    // in any app — no app list gates it any more (build 46)
+                    requestShot()
                 }
                 // live score badge (if the user turned it on): refresh every
                 // tick — it also hides itself when the lock ends
@@ -918,29 +913,6 @@ class ImageGuardService : Service() {
         } catch (_: Exception) {
             null
         }
-    }
-
-    private var lastSkipLine: String? = null
-
-    /** True when the foreground app is on the scan list — the only apps
-     * the guard watches (the user's choice). The foreground package comes
-     * from the accessibility service, which sees every window change; if
-     * it is unknown (service not running yet), don't scan. */
-    private fun shouldScan(): Boolean {
-        val fg = PowerBlockService.foregroundPkg ?: return false
-        return Extra.lockdownApps(this).contains(fg)
-    }
-
-    /** Diagnostic: log once when scanning pauses because the foreground app
-     * is not on the list (change-only, so the log isn't spammed every
-     * second). The score lines resume on their own when scanning restarts. */
-    private fun logScanSkipped() {
-        val fg = PowerBlockService.foregroundPkg
-        val line = if (fg == null) "স্ক্যান বন্ধ: সামনের অ্যাপ জানা নেই"
-        else "স্ক্যান বন্ধ: " + appLabel(fg) + " তালিকায় নেই"
-        if (line == lastSkipLine) return
-        lastSkipLine = line
-        dbgSummary("[${stamp()}] $line")
     }
 
     private fun appLabel(pkg: String): String {
@@ -1313,30 +1285,26 @@ class ImageGuardService : Service() {
                 l
             }
         } ?: "?"
-        val scanning = fg != null && Extra.lockdownApps(this).contains(fg)
+        // the guard scans everywhere now (build 46) — the badge always
+        // shows the live score while a lock runs, in any app
         val mid = Extra.igModel(this)
         tv.visibility = if (showScore) View.VISIBLE else View.GONE
         if (showScore) {
-            if (!scanning) {
-                tv.text = "$label — • $mid"
-                tv.setTextColor(C.muted)
-            } else {
-                val s = lastScore
-                val threshold = Extra.igThreshold(this)
-                val pct = if (s == null) "--" else "${(s * 100).toInt()}%"
-                val thrPct = "${(threshold * 100).toInt()}%"
-                // current score vs the threshold at which the screen blocks,
-                // e.g. "Chrome 4% / 50% • L" — the screen blocks at 50%,
-                // and L is the model doing the scoring
-                tv.text = "$label $pct / $thrPct • $mid"
-                tv.setTextColor(if (s != null && s >= threshold * 0.5f) C.warn else C.primary)
-            }
+            val s = lastScore
+            val threshold = Extra.igThreshold(this)
+            val pct = if (s == null) "--" else "${(s * 100).toInt()}%"
+            val thrPct = "${(threshold * 100).toInt()}%"
+            // current score vs the threshold at which the screen blocks,
+            // e.g. "Chrome 4% / 50% • L" — the screen blocks at 50%,
+            // and L is the model doing the scoring
+            tv.text = "$label $pct / $thrPct • $mid"
+            tv.setTextColor(if (s != null && s >= threshold * 0.5f) C.warn else C.primary)
         }
         // live preview: the highest-scoring tile — the region the model
         // found most suspicious (with tiling, the model checks tiles, not
         // the whole frame at once)
         if (iv != null) {
-            val frame = if (showPreview && scanning) lastFrame else null
+            val frame = if (showPreview) lastFrame else null
             iv.visibility = if (frame != null) View.VISIBLE else View.GONE
             if (frame != null && frame !== shownFrame) {
                 iv.setImageBitmap(frame)

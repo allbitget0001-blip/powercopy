@@ -71,11 +71,11 @@ class PowerBlockService : AccessibilityService() {
         val debugSummary = mutableListOf<String>()
 
         /** Current foreground package, published on every window change.
-         * Read by ImageGuardService: the guard only scans while a
-         * lockdown-listed app is in front. Transient overlays (keyboard,
-         * System UI, permission dialogs) never replace it — they can open
-         * without the app underneath firing a return event, which used to
-         * pause scanning until the user switched apps. */
+         * Read by ImageGuardService for the badge label and the score log
+         * lines. Transient overlays (keyboard, System UI, permission
+         * dialogs) never replace it — they can open without the app
+         * underneath firing a return event, which used to pause scanning
+         * until the user switched apps. */
         @Volatile
         var foregroundPkg: String? = null
 
