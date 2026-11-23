@@ -71,7 +71,7 @@ object Extra {
 
     /** Build number, bumped on every push — shown in Settings so the user can
      * confirm which build is installed. A String because L.num takes a String. */
-    const val BUILD_ID = "44"
+    const val BUILD_ID = "45"
 
     // ---------- presets ----------
 
@@ -1338,8 +1338,8 @@ fun MainActivity.imageGuardCard(): View {
     c.addView(
         tv(
             L.t(
-                "While a lock runs, on-device AI watches the screen inside your chosen lockdown apps and covers nude photos or videos the moment they appear. Experimental — it can sometimes be wrong, and it uses more battery. No image ever leaves the phone. The powerful model downloads once (~106 MB — Wi-Fi recommended).",
-                "লক চলাকালীন ফোনের ভেতরেই AI শুধু লকডাউন তালিকার অ্যাপগুলোর স্ক্রিন দেখবে, আর নগ্ন ছবি বা ভিডিও আসলেই তা ঢেকে দেবে। পরীক্ষামূলক — মাঝে মাঝে ভুল হতে পারে, আর ব্যাটারি একটু বেশি খাবে। কোনো ছবি ফোনের বাইরে যাবে না। শক্তিশালী মডেল একবার ডাউনলোড হবে (~১০৬ MB — Wi-Fi দিয়ে করা ভালো)।"
+                "While a lock runs, on-device AI watches the screen inside your chosen scan apps and covers nude photos or videos the moment they appear. Experimental — it can sometimes be wrong, and it uses more battery. No image ever leaves the phone. The powerful model downloads once (~106 MB — Wi-Fi recommended).",
+                "লক চলাকালীন ফোনের ভেতরেই AI শুধু বাছা অ্যাপগুলোর স্ক্রিন দেখবে, আর নগ্ন ছবি বা ভিডিও আসলেই তা ঢেকে দেবে। পরীক্ষামূলক — মাঝে মাঝে ভুল হতে পারে, আর ব্যাটারি একটু বেশি খাবে। কোনো ছবি ফোনের বাইরে যাবে না। শক্তিশালী মডেল একবার ডাউনলোড হবে (~১০৬ MB — Wi-Fi দিয়ে করা ভালো)।"
             ),
             13f, C.muted
         ),
@@ -1352,9 +1352,6 @@ fun MainActivity.imageGuardCard(): View {
         else {
             Extra.setImageGuardOn(this, false)
             ImageGuardService.sync(this)
-            // release the capture session too: a stopped projection kills
-            // its token, so keeping the grant would leave a dead one behind
-            ImageGuardService.releaseGrant()
             go(4)
         }
     }
@@ -1459,28 +1456,34 @@ fun MainActivity.imageGuardCard(): View {
     // status line
     val modelErr = Extra.igModelError(this)
     // the error flag is stale history (it survives app updates); the file
-    // check and the grant check are current truth, so they come first —
-    // otherwise a stale flag hides the re-grant prompt and the guard can
-    // never start again after an update (dead end: no grant, no service,
-    // no log, and the only offered way out re-downloads a good model)
-    val needsGrant = on && ImageGuardModel.ready(this) && !ImageGuardService.hasProjection()
+    // check is current truth, so it comes first — otherwise a stale flag
+    // hides the real state and the guard can never start again after an
+    // update (dead end: no service, no log, and the only offered way out
+    // re-downloads a good model)
+    val unsupported = Build.VERSION.SDK_INT < 28
+    val noAccess = !ImageGuardService.accessibilityOn(this)
     val status = when {
         !on -> L.t("Off", "বন্ধ")
+        unsupported -> L.t("Not supported on this phone — Android 9 or newer is needed", "এই ফোনে চলবে না — Android 9 বা তার ওপরের ভার্সন লাগবে")
         !ImageGuardModel.ready(this) -> L.t("Model ${Extra.igModel(this)} not downloaded yet — tap here to download", "মডেল ${Extra.igModel(this)} এখনো ডাউনলোড হয়নি — ডাউনলোড করতে এখানে চাপুন")
-        needsGrant -> L.t("Tap here to allow screen capture", "স্ক্রিন দেখার অনুমতি দিতে এখানে চাপুন")
+        noAccess -> L.t("Accessibility service is off — tap here to turn it on", "অ্যাক্সেসিবিলিটি সার্ভিস বন্ধ — চালু করতে এখানে চাপুন")
         modelErr -> L.t("Model failed to load — turn it off and on again to re-download", "মডেল লোড হয়নি — আবার ডাউনলোড করতে বন্ধ করে চালু করুন")
         Store.isActive(this) || Store.isLocProtecting(this) -> L.t("Lock running — watching the screen", "লক চলছে — স্ক্রিন পর্যবেক্ষণ চলছে")
         else -> L.t("On — active while a lock runs", "চালু আছে — লক চললে সক্রিয় হবে")
     }
     val statusTv = tv(status, 12f, if (!on) C.muted else C.primary)
-    // the grant can be lost mid-session (revoked, or the service stopped);
-    // re-granting restores protection, so it is allowed even during a lock
-    if (needsGrant) {
-        statusTv.setOnClickListener { requestImageGuardPermission() }
-    } else if (on && !ImageGuardModel.ready(this)) {
+    if (on && !ImageGuardModel.ready(this)) {
         // the selected model is missing (deleted, or its download failed):
         // tapping re-downloads it (asks before using mobile data, like the switcher)
         statusTv.setOnClickListener { downloadModel(Extra.igModel(this)) }
+    } else if (on && noAccess) {
+        statusTv.setOnClickListener {
+            try {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            } catch (e: Exception) {
+                Log.e(TAG, "accessibility settings failed", e)
+            }
+        }
     }
     c.addView(statusTv, lp(MATCH, WRAP, t = dp(8)))
     // diagnostic log: what the guard actually did on the phone — open it
@@ -1540,15 +1543,15 @@ fun MainActivity.imageGuardCard(): View {
     return c
 }
 
-/** Lockdown app list: when the guard's screen-capture grant ends mid-lock
- * (screen lock, or revoked), only these apps are covered by the protection
- * screen until permission is given again — every other app opens normally. */
+/** Scan list: the guard only looks for bad images inside these apps.
+ * Other apps keep opening normally and are never scanned, which also
+ * saves battery. */
 fun MainActivity.lockdownAppsCard(): View {
     val c = card()
-    c.addView(section(L.t("Lockdown apps", "লকডাউন অ্যাপ")))
+    c.addView(section(L.t("Apps to scan", "স্ক্যান করার অ্যাপ")))
     c.addView(
         tv(
-            L.t("If screen-capture permission ends while a lock runs, only the apps you choose here are blocked until you allow it again — and the guard only looks for bad images inside these apps. Other apps keep opening normally and are never scanned, which also saves battery. Choose the apps where bad content could appear — browsers, gallery, social apps.", "লক চলাকালীন স্ক্রিন দেখার অনুমতি শেষ হয়ে গেলে শুধু এখানে বাছা অ্যাপগুলো ব্লক হবে, আবার অনুমতি না দেওয়া পর্যন্ত — আর গার্ড শুধু এই অ্যাপগুলোতেই খারাপ ছবি খুঁজবে। বাকি অ্যাপগুলো স্বাভাবিকভাবে খুলবে আর সেগুলোতে স্ক্যান হবে না, তাই ব্যাটারিও কম খাবে। যেসব অ্যাপে খারাপ জিনিস আসতে পারে সেগুলো বাছুন — ব্রাউজার, গ্যালারি, সোশ্যাল অ্যাপ।"),
+            L.t("The guard only watches the apps you choose here — other apps keep opening normally and are never scanned, which also saves battery. Choose the apps where bad content could appear — browsers, gallery, social apps.", "গার্ড শুধু এখানে বাছা অ্যাপগুলোতেই খারাপ ছবি খুঁজবে — বাকি অ্যাপগুলো স্বাভাবিকভাবে খুলবে আর সেগুলোতে স্ক্যান হবে না, তাই ব্যাটারিও কম খাবে। যেসব অ্যাপে খারাপ জিনিস আসতে পারে সেগুলো বাছুন — ব্রাউজার, গ্যালারি, সোশ্যাল অ্যাপ।"),
             13f, C.muted
         ),
         lp(MATCH, WRAP, t = dp(6))
@@ -1566,7 +1569,7 @@ fun MainActivity.lockdownAppsCard(): View {
     pkgBtn.setOnClickListener { addPackageDialog("lockdown") { go(4) } }
     c.addView(pkgBtn, lp(MATCH, dp(48), t = dp(8)))
     if (count == 0) {
-        c.addView(tv(L.t("No apps chosen — if permission ends, nothing will be blocked, and the guard will scan nothing.", "কোনো অ্যাপ বাছা হয়নি — অনুমতি শেষ হলে কিছুই ব্লক হবে না, আর গার্ড কিছুই স্ক্যান করবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
+        c.addView(tv(L.t("No apps chosen — the guard will scan nothing.", "কোনো অ্যাপ বাছা হয়নি — গার্ড কিছুই স্ক্যান করবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
     }
     if (locked) {
         c.addView(tv(L.t("While a session runs, apps can only be added, not removed.", "সেশন চলাকালীন শুধু অ্যাপ যোগ করা যাবে, সরানো যাবে না।"), 12f, C.warn), lp(MATCH, WRAP, t = dp(8)))
@@ -1574,10 +1577,16 @@ fun MainActivity.lockdownAppsCard(): View {
     return c
 }
 
-/** Enable flow: download the model first (once), then ask for screen-capture
- * permission. ig_on is only written when the permission is granted (see
- * MainActivity.onActivityResult) — a failed setup leaves the guard off. */
+/** Enable flow: download the model first (once), then switch the guard
+ * on — no permission step any more (build 45: screenshots come from the
+ * accessibility service). ig_on is only written once the model is ready;
+ * a failed download leaves the guard off. */
 private fun MainActivity.enableImageGuard() {
+    if (Build.VERSION.SDK_INT < 28) {
+        toast(L.t("Image guard needs Android 9 or newer", "ছবি সুরক্ষার জন্য Android 9 বা তার ওপরের ভার্সন লাগবে"))
+        go(4)
+        return
+    }
     // only download when the file is genuinely missing or incomplete — a
     // stale load-error flag must never delete a good model and spend
     // another 106 MB; a complete file gets its load retried by the service
@@ -1617,11 +1626,17 @@ private fun MainActivity.enableImageGuard() {
                     go(4)
                     return@runOnUiThread
                 }
-                requestImageGuardPermission()
+                Extra.setImageGuardOn(this, true)
+                ImageGuardService.sync(this)
+                toast(L.t("Image guard is on", "ছবি সুরক্ষা চালু হয়েছে"))
+                go(4)
             }
         }.start()
     } else {
-        requestImageGuardPermission()
+        Extra.setImageGuardOn(this, true)
+        ImageGuardService.sync(this)
+        toast(L.t("Image guard is on", "ছবি সুরক্ষা চালু হয়েছে"))
+        go(4)
     }
 }
 
@@ -1690,33 +1705,6 @@ private fun MainActivity.startModelDownload(modelId: String, meta: ImageGuardMod
             go(4)
         }
     }.start()
-}
-
-/**
- * Notification deep-link: the user tapped "allow screen capture again"
- * after the projection ended (e.g. the screen locked — Android stops
- * every share on lock and the token is single-use, so a fresh grant is
- * the only recovery). Jump to the Protection tab and open the permission
- * dialog at once, so recovery is one tap plus the system dialog instead
- * of hunting through the app.
- */
-fun MainActivity.handleRegrantDeepLink() {
-    if (!Extra.imageGuardOn(this)) return
-    if (ImageGuardService.hasProjection()) return
-    if (!ImageGuardModel.ready(this)) return
-    go(4, false)
-    requestImageGuardPermission()
-}
-
-@Suppress("DEPRECATION")
-private fun MainActivity.requestImageGuardPermission() {
-    try {
-        startActivityForResult(Intent(this, ImageGuardPermissionActivity::class.java), REQ_IMAGE_GUARD)
-    } catch (e: Exception) {
-        Log.e(TAG, "image guard permission failed", e)
-        toast(L.t("Could not open the permission screen", "অনুমতির স্ক্রিন খোলা যায়নি"))
-        go(4)
-    }
 }
 
 /** Diagnostic card: what the service sees on a reels screen, so a missed block

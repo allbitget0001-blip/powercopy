@@ -1,6 +1,5 @@
 package com.example.powerlocks
 
-import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -15,11 +14,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
-import android.media.ImageReader
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -27,6 +21,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
@@ -53,9 +48,6 @@ import java.util.Date
 import java.util.Locale
 import javax.net.ssl.HttpsURLConnection
 import kotlin.math.roundToInt
-
-/** Request code for the screen-capture permission activity. */
-const val REQ_IMAGE_GUARD = 1041
 
 /**
  * The on-device NSFW models (OwenElliott/image-safety-classifier-*, MIT):
@@ -554,84 +546,39 @@ private class NsfwModel private constructor(
 }
 
 /**
- * Image guard: while a lock runs, captures the screen with MediaProjection,
- * classifies a frame every ~1s with the on-device ONNX model, and when the
- * NSFW score passes the sensitivity threshold covers the screen and sends
- * the user Home. Nothing is saved or sent anywhere — frames are classified
- * in memory and recycled at once.
+ * Image guard: while a lock runs, takes a screenshot of the screen about
+ * once a second (through the accessibility service — no screen-share
+ * permission is needed, and there is no grant to lose when the screen
+ * locks), classifies each frame with the on-device ONNX model, and when
+ * the NSFW score passes the sensitivity threshold covers the screen and
+ * sends the user Home. Nothing is saved or sent anywhere — frames are
+ * classified in memory and recycled at once.
  *
- * The service only runs while the guard is on AND a lock is protecting
- * (see [sync]); the sampling loop itself also checks the lock, so no frame
- * is ever captured outside a lock. Screen-capture permission is granted
- * through [ImageGuardPermissionActivity] and is lost on reboot — in that
- * case the user gets a notification asking to allow it again. The live
- * MediaProjection is held statically and reused across service restarts:
- * its token dies once the projection is stopped, so stopping the service
- * must never stop the projection (see [releaseGrant]).
+ * The service only runs while the guard is on AND the model is ready
+ * (see [sync]); the sampling loop itself also checks the lock, so no
+ * frame is ever captured outside a lock. Screenshots need Android 9+
+ * (takeScreenshot arrived in API 28) and the accessibility service
+ * enabled — the guard cannot work without either.
  */
 class ImageGuardService : Service() {
 
     companion object {
-        const val ACTION_PREPARE = "com.example.powerlocks.IG_PREPARE"
-        const val ACTION_SET_PROJECTION = "com.example.powerlocks.IG_SET_PROJECTION"
         const val ACTION_START = "com.example.powerlocks.IG_START"
 
         private const val NOTIF_ID = 11
-        private const val NOTIF_REGRANT_ID = 12
         private const val NOTIF_MODEL_ERR_ID = 13
         private const val CHANNEL_ID = "powerlock_image"
         private const val SCAN_INTERVAL_MS = 1000L
         private const val IDLE_INTERVAL_MS = 3000L
         private const val COVER_HIDE_MS = 1500L
         private const val DETECT_COOLDOWN_MS = 5000L
-        private const val REGRANT_NOTIFY_MIN_MS = 30 * 60_000L
+        // Android rate-limits accessibility screenshots (about one per
+        // second): never ask sooner than this after the last shot
+        private const val SHOT_MIN_MS = 1100L
 
         @Volatile
         var isRunning = false
             private set
-
-        /** The screen-capture grant from the permission activity. Static on
-         * purpose: it survives a service restart, but not a reboot or a
-         * process kill — then the user must allow it again. */
-        @Volatile
-        private var projectionResultCode = Activity.RESULT_CANCELED
-
-        @Volatile
-        private var projectionData: Intent? = null
-
-        /**
-         * The live MediaProjection, held statically so [releaseGrant] can
-         * stop it from the toggle-off path. It belongs to ONE service
-         * instance: on Android 14+ the token can only ever produce one
-         * MediaProjection, and that projection can only ever create ONE
-         * VirtualDisplay — so it is created once, kept for the whole life
-         * of the service, and stopped in onDestroy. A stopped projection
-         * is never reused (a second createVirtualDisplay on it throws
-         * "non-current MediaProjection"); recovery is a fresh user grant.
-         */
-        @Volatile
-        private var mediaProjection: MediaProjection? = null
-
-        @Volatile
-        private var lastRegrantNotify = 0L
-
-        fun hasProjection(): Boolean = projectionData != null
-
-        /**
-         * Fully releases the screen-capture session: stops the projection
-         * and forgets the grant. Called when the user turns the guard off,
-         * so no capture session lingers while the guard is off. The next
-         * enable runs the permission flow again for a fresh grant.
-         */
-        fun releaseGrant() {
-            try {
-                mediaProjection?.stop()
-            } catch (_: Exception) {
-            }
-            mediaProjection = null
-            projectionData = null
-            projectionResultCode = Activity.RESULT_CANCELED
-        }
 
         /** Plain-language diagnostic lines (newest last), capped at 60. */
         val debugSummary = mutableListOf<String>()
@@ -670,25 +617,23 @@ class ImageGuardService : Service() {
         }
 
         /**
-         * Starts the service iff the guard is on, the model is downloaded
-         * and the screen-capture grant exists; otherwise stops it. The
-         * service stays running the whole time the guard is on — it must
-         * NOT stop between locks: on Android 14+ a MediaProjection can
-         * create a VirtualDisplay only ONCE, so a stopped-and-restarted
-         * service could never capture again with the same grant (the
-         * "non-current MediaProjection" failure). Only the SCANNING is
-         * gated on a lock (see tick); the capture session stays alive.
-         * Cheap and idempotent — safe to call every second from the
-         * MainActivity ticker and from the accessibility service.
-         * Starting a foreground service from the background can throw; that
-         * is caught here and retried on the next call, never a crash.
+         * Starts the service iff the guard is on, the model is downloaded,
+         * the device can take accessibility screenshots (Android 9+) and
+         * the accessibility service is enabled; otherwise stops it. The
+         * service stays running the whole time the guard is on — only the
+         * SCANNING is gated on a lock (see tick). Cheap and idempotent —
+         * safe to call every second from the MainActivity ticker and from
+         * the accessibility service. Starting a foreground service from
+         * the background can throw; that is caught here and retried on
+         * the next call, never a crash.
          */
         @Synchronized
         fun sync(ctx: Context) {
             try {
-                val on = Extra.imageGuardOn(ctx)
+                val supported = Build.VERSION.SDK_INT >= 28
+                val on = supported && Extra.imageGuardOn(ctx) && accessibilityOn(ctx)
                 val modelOk = ImageGuardModel.ready(ctx)
-                val want = on && modelOk && projectionData != null
+                val want = on && modelOk
                 if (want && !isRunning) {
                     ctx.startForegroundService(
                         Intent(ctx, ImageGuardService::class.java).setAction(ACTION_START)
@@ -696,14 +641,21 @@ class ImageGuardService : Service() {
                 } else if (!want && isRunning) {
                     ctx.stopService(Intent(ctx, ImageGuardService::class.java))
                 }
-                // the guard is wanted but the capture grant is gone (reboot /
-                // revoked): remind the user to allow it again, at most every
-                // 30 minutes
-                if (on && modelOk && projectionData == null) {
-                    maybeNotifyRegrant(ctx)
-                }
             } catch (e: Exception) {
                 Log.e(TAG, "ImageGuard sync failed", e)
+            }
+        }
+
+        /** True when this app's accessibility service is enabled — the
+         * guard needs it for screenshots and for the foreground app. */
+        fun accessibilityOn(ctx: Context): Boolean {
+            return try {
+                val enabled = Settings.Secure.getString(
+                    ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                ) ?: return false
+                enabled.split(':').any { it.startsWith(ctx.packageName + "/") }
+            } catch (_: Exception) {
+                false
             }
         }
 
@@ -719,54 +671,17 @@ class ImageGuardService : Service() {
             }
         }
 
-        fun notifyRegrantNow(ctx: Context) {
-            try {
-                ensureChannel(ctx)
-                L.load(ctx)
-                // deep-link: tapping the notification jumps straight to the
-                // permission dialog (Protection tab), so recovery after a
-                // screen lock is one tap plus the system dialog. Distinct
-                // request code so it never collides with the model-error
-                // notification's plain MainActivity PendingIntent.
-                val pi = PendingIntent.getActivity(
-                    ctx, NOTIF_REGRANT_ID,
-                    Intent(ctx, MainActivity::class.java).putExtra("ig_regrant", true),
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
-                val b = Notification.Builder(ctx, CHANNEL_ID)
-                    .setSmallIcon(android.R.drawable.ic_lock_lock)
-                    .setContentTitle(L.t("Image guard needs permission again", "ছবি সুরক্ষার জন্য আবার অনুমতি দিন"))
-                    .setContentText(
-                        if (Store.isActive(ctx) || Store.isLocProtecting(ctx))
-                            L.t("Screen-capture permission ended — your lockdown apps stay closed until you allow it again", "স্ক্রিন দেখার অনুমতি শেষ হয়ে গেছে — আবার না দিলে লকডাউন তালিকার অ্যাপগুলো খুলবে না")
-                        else
-                            L.t("Screen-capture permission ended — open PowerLock to allow it again", "স্ক্রিন দেখার অনুমতি শেষ হয়ে গেছে — আবার দিতে PowerLock খুলুন")
-                    )
-                    .setContentIntent(pi)
-                    .setAutoCancel(true)
-                (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                    .notify(NOTIF_REGRANT_ID, b.build())
-                lastRegrantNotify = SystemClock.uptimeMillis()
-            } catch (e: Exception) {
-                Log.e(TAG, "regrant notify failed", e)
-            }
-        }
-
-        private fun maybeNotifyRegrant(ctx: Context) {
-            val now = SystemClock.uptimeMillis()
-            if (now - lastRegrantNotify < REGRANT_NOTIFY_MIN_MS) return
-            notifyRegrantNow(ctx)
-        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private var inferThread: HandlerThread? = null
     private var inferHandler: Handler? = null
-    // the live MediaProjection lives in the companion object (see there);
-    // each service instance only tracks whether ITS callback is registered
-    private var callbackRegistered = false
-    private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
+    // screenshot capture (build 45): a shot is requested from the
+    // accessibility service about once a second — never while one is
+    // still pending, and never sooner than SHOT_MIN_MS after the last one
+    @Volatile
+    private var shotPending = false
+    private var lastShotAt = 0L
 
     @Volatile
     private var inferBusy = false
@@ -822,30 +737,6 @@ class ImageGuardService : Service() {
     @Volatile
     private var lastScore: Float? = null
 
-    private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() {
-            // the grant was revoked (e.g. from the status bar) or released:
-            // forget the token AND the dead projection, and stop — sync()
-            // will not restart us without a fresh grant. Only notify when
-            // the guard is still on: a deliberate turn-off releases the
-            // projection too, and that needs no reminder.
-            try {
-                projectionData = null
-                mediaProjection = null
-                callbackRegistered = false
-                dbgSummary("[${stamp()}] স্ক্রিন অনুমতি শেষ হয়ে গেছে")
-                dbg("projection onStop (revoked)")
-                releaseCapture()
-                if (Extra.imageGuardOn(this@ImageGuardService)) {
-                    notifyRegrantNow(this@ImageGuardService)
-                }
-                stopSelf()
-            } catch (e: Exception) {
-                Log.e(TAG, "projection callback failed", e)
-            }
-        }
-    }
-
     private val tick = object : Runnable {
         override fun run() {
             var nextDelay = SCAN_INTERVAL_MS
@@ -855,12 +746,9 @@ class ImageGuardService : Service() {
                     // cooling down after a detection: the cover itself must
                     // never be scanned
                 } else if (!protecting()) {
-                    // no lock: do NOT scan — but do NOT release the capture
-                    // either. On Android 14+ a MediaProjection can create a
-                    // VirtualDisplay only once, so releasing it here would
-                    // make the next lock unable to capture at all (the
-                    // "non-current MediaProjection" failure). The capture
-                    // stays alive; only the scanning pauses.
+                    // no lock: do NOT scan. The service stays alive (only
+                    // the scanning pauses), so the next lock starts
+                    // scanning at once.
                     nextDelay = IDLE_INTERVAL_MS
                     idleTicks++
                     // idle for ~30s: let sync() stop us if we are no longer
@@ -871,22 +759,13 @@ class ImageGuardService : Service() {
                     }
                 } else {
                     idleTicks = 0
-                    if (mediaProjection == null) initProjection()
-                    if (mediaProjection == null) {
-                        nextDelay = IDLE_INTERVAL_MS
+                    // scoped scanning: only the apps on the scan list are
+                    // watched (the user's choice)
+                    if (shouldScan()) {
+                        lastSkipLine = null
+                        requestShot()
                     } else {
-                        if (virtualDisplay == null) startCapture()
-                        // scoped scanning: only the apps on the lockdown
-                        // list are watched (the user's choice). The capture
-                        // stays alive either way — never release it, a
-                        // MediaProjection can create a VirtualDisplay only
-                        // once.
-                        if (shouldScan()) {
-                            lastSkipLine = null
-                            scanFrame()
-                        } else {
-                            logScanSkipped()
-                        }
+                        logScanSkipped()
                     }
                 }
                 // live score badge (if the user turned it on): refresh every
@@ -915,42 +794,15 @@ class ImageGuardService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
-            when (intent?.action) {
-                ACTION_PREPARE -> goForeground()
-                ACTION_SET_PROJECTION -> {
-                    goForeground()
-                    val code = intent.getIntExtra("code", Activity.RESULT_CANCELED)
-                    @Suppress("DEPRECATION")
-                    val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-                        intent.getParcelableExtra("data", Intent::class.java)
-                    } else {
-                        intent.getParcelableExtra("data")
-                    }
-                    if (code == Activity.RESULT_OK && data != null) {
-                        projectionResultCode = code
-                        projectionData = data
-                        dbgSummary("[${stamp()}] স্ক্রিন অনুমতি পাওয়া গেছে")
-                        dbg("SET_PROJECTION ok")
-                        initProjection()
-                        startSampling()
-                    }
-                }
-                else -> { // ACTION_START or a system restart (null intent)
-                    if (projectionData == null) {
-                        // no grant (e.g. process was killed): stop, and let
-                        // sync() post the re-grant reminder instead
-                        dbgSummary("[${stamp()}] গার্ড চালু হতে পারেনি — স্ক্রিন অনুমতি নেই")
-                        dbg("START: no grant, stopSelf")
-                        stopSelf()
-                    } else {
-                        dbgSummary("[${stamp()}] গার্ড চালু হয়েছে")
-                        dbg("START: service started")
-                        goForeground()
-                        initProjection()
-                        startSampling()
-                    }
-                }
-            }
+            // ACTION_START or a system restart (null intent): no grant is
+            // needed any more — screenshots come from the accessibility
+            // service, which is already running (sync() only starts us
+            // when the guard is on, the model is ready and accessibility
+            // is enabled)
+            dbgSummary("[${stamp()}] গার্ড চালু হয়েছে")
+            dbg("START: service started (screenshot capture)")
+            goForeground()
+            startSampling()
         } catch (e: Exception) {
             Log.e(TAG, "ImageGuard start failed", e)
         }
@@ -964,21 +816,6 @@ class ImageGuardService : Service() {
         try {
             handler.removeCallbacks(tick)
             handler.removeCallbacksAndMessages(null)
-            releaseCapture()
-            // The MediaProjection IS stopped here: on Android 14+ it can
-            // only ever create one VirtualDisplay, so a projection carried
-            // into a restarted service could never capture again anyway
-            // ("non-current MediaProjection"). Stopping it cleanly and
-            // forgetting the grant means the next enable asks the user for
-            // a fresh grant instead of silently never working.
-            try {
-                if (callbackRegistered) {
-                    mediaProjection?.unregisterCallback(projectionCallback)
-                }
-            } catch (_: Exception) {
-            }
-            callbackRegistered = false
-            releaseGrant()
             hideCover()
             hideScoreBadge()
             recycleFrames()
@@ -1005,7 +842,7 @@ class ImageGuardService : Service() {
 
     private fun protecting(): Boolean = Store.isActive(this) || Store.isLocProtecting(this)
 
-    /** Must run BEFORE getMediaProjection() on Android 14 (target 34). */
+    /** Foreground service, type specialUse (matches the manifest). */
     private fun goForeground() {
         if (foreground) return
         foreground = true
@@ -1020,39 +857,9 @@ class ImageGuardService : Service() {
             .setOngoing(true)
             .setContentIntent(pi)
         if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, b.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            startForeground(NOTIF_ID, b.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIF_ID, b.build())
-        }
-    }
-
-    /**
-     * Creates the live MediaProjection from the stored grant, once per
-     * service instance. On Android 14+ the token is single-use: it can
-     * only ever produce ONE MediaProjection, and that projection can only
-     * ever create ONE VirtualDisplay — so the projection is created here,
-     * kept for the whole life of the service, and stopped in onDestroy.
-     * A dead projection is never reused: recovery is a fresh user grant.
-     */
-    private fun initProjection() {
-        if (mediaProjection != null) return // already created by this instance
-        val data = projectionData ?: return
-        try {
-            val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val proj = mpm.getMediaProjection(projectionResultCode, data)
-            proj.registerCallback(projectionCallback, handler)
-            callbackRegistered = true
-            mediaProjection = proj
-            dbgSummary("[${stamp()}] স্ক্রিন সংযোগ হয়েছে")
-            dbg("projection created")
-        } catch (e: Exception) {
-            Log.e(TAG, "getMediaProjection failed", e)
-            projectionData = null
-            mediaProjection = null
-            dbgSummary("[${stamp()}] স্ক্রিন সংযোগ হয়নি")
-            dbg("getMediaProjection failed: ${e.message}")
-            notifyRegrantNow(this)
-            stopSelf()
         }
     }
 
@@ -1061,91 +868,61 @@ class ImageGuardService : Service() {
         handler.post(tick)
     }
 
-    private fun startCapture() {
-        val proj = mediaProjection ?: return
-        try {
-            val metrics = resources.displayMetrics
+    /** Asks the accessibility service for a screenshot of the display and
+     * scores it when it arrives. Screenshots are rate-limited by Android
+     * (about one per second), so a tick while one is still pending — or
+     * too soon after the last one — is skipped, never queued. The
+     * callback runs on the screenshot worker thread; scanFrame() only
+     * does bitmap work there and posts the inference to its own thread. */
+    private fun requestShot() {
+        if (shotPending) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastShotAt < SHOT_MIN_MS) return
+        // screen off: nothing to see, and the shot would fail anyway
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (pm != null && !pm.isInteractive) return
+        lastShotAt = now
+        shotPending = true
+        PowerBlockService.requestScreenshot { bmp ->
+            shotPending = false
+            if (destroyed) {
+                try {
+                    bmp?.recycle()
+                } catch (_: Exception) {
+                }
+                return@requestScreenshot
+            }
+            if (bmp == null) return@requestScreenshot
+            // the shot is full resolution: shrink it to the working size
+            // the tiling expects (540 wide, like the old capture) before
+            // scoring. scanFrame() owns and recycles the frame it gets.
+            val small = downscaleShot(bmp)
+            if (small !== bmp) {
+                try {
+                    bmp.recycle()
+                } catch (_: Exception) {
+                }
+            }
+            if (small != null) scanFrame(small)
+        }
+    }
+
+    /** Shrinks a full-resolution screenshot to the working size (540 wide,
+     * keeping the aspect ratio) — the size the old capture used, and what
+     * the tiling expects. Returns null on failure. */
+    private fun downscaleShot(bmp: Bitmap): Bitmap? {
+        return try {
             val w = 540
-            val h = (540f * metrics.heightPixels / metrics.widthPixels).toInt().coerceIn(240, 1200)
-            val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-            val vd = proj.createVirtualDisplay(
-                "ImageGuard", w, h, metrics.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, null
-            )
-            imageReader = reader
-            virtualDisplay = vd
-            dbgSummary("[${stamp()}] স্ক্রিন দেখা শুরু হয়েছে")
-            dbg("capture started ${w}x$h")
-        } catch (e: Exception) {
-            Log.e(TAG, "startCapture failed", e)
-            dbg("startCapture failed: ${e.message}")
-            releaseCapture()
-            // the projection can no longer create a VirtualDisplay (on
-            // Android 14+ each projection gets exactly one): the session is
-            // dead and only a fresh user grant can fix it — stop cleanly
-            // instead of retrying forever, and ask the user to allow
-            // capture again
-            dbgSummary("[${stamp()}] স্ক্রিন দেখা শুরু হয়নি — আবার অনুমতি দিন")
-            releaseGrant()
-            notifyRegrantNow(this)
-            stopSelf()
-        }
-    }
-
-    private fun releaseCapture() {
-        try {
-            virtualDisplay?.release()
+            val h = (540f * bmp.height / bmp.width).toInt().coerceIn(240, 1200)
+            Bitmap.createScaledBitmap(bmp, w, h, true)
         } catch (_: Exception) {
-        }
-        virtualDisplay = null
-        try {
-            imageReader?.close()
-        } catch (_: Exception) {
-        }
-        imageReader = null
-    }
-
-    /** Latest frame as a Bitmap, or null when no frame is available yet. */
-    private fun frameBitmap(): Bitmap? {
-        val reader = imageReader ?: return null
-        val image = try {
-            reader.acquireLatestImage()
-        } catch (e: Exception) {
             null
-        } ?: return null
-        try {
-            val w = image.width
-            val h = image.height
-            val plane = image.planes[0]
-            val buf = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val rowPadding = rowStride - pixelStride * w
-            val full = Bitmap.createBitmap(
-                w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888
-            )
-            full.copyPixelsFromBuffer(buf)
-            if (rowPadding == 0) return full
-            val cropped = Bitmap.createBitmap(full, 0, 0, w, h)
-            try {
-                full.recycle()
-            } catch (_: Exception) {
-            }
-            return cropped
-        } catch (e: Exception) {
-            Log.e(TAG, "frameBitmap failed", e)
-            return null
-        } finally {
-            try {
-                image.close()
-            } catch (_: Exception) {
-            }
         }
     }
 
     private var lastSkipLine: String? = null
 
-    /** True when the foreground app is on the lockdown list — the only apps
+    /** True when the foreground app is on the scan list — the only apps
      * the guard watches (the user's choice). The foreground package comes
      * from the accessibility service, which sees every window change; if
      * it is unknown (service not running yet), don't scan. */
@@ -1196,8 +973,9 @@ class ImageGuardService : Service() {
         return rects
     }
 
-    private fun scanFrame() {
-        val bmp = frameBitmap() ?: return
+    /** Tiles the frame and scores every tile (see tileRects). Takes
+     * ownership of [bmp] and recycles it. */
+    private fun scanFrame(bmp: Bitmap) {
         val meta = ImageGuardModel.info(Extra.igModel(this))
         // tile the frame (see tileRects): each tile is scored on its own
         // and the highest score wins, so a small explicit region is no
@@ -1512,7 +1290,7 @@ class ImageGuardService : Service() {
     private fun updateScoreBadge() {
         val showScore = Extra.liveScoreOn(this)
         val showPreview = Extra.previewOn(this)
-        val show = (showScore || showPreview) && protecting() && mediaProjection != null &&
+        val show = (showScore || showPreview) && protecting() &&
             Settings.canDrawOverlays(this)
         if (!show) {
             hideScoreBadge()
